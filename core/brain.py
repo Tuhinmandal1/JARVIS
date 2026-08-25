@@ -5,6 +5,14 @@ from google import genai
 from google.genai import types
 
 from tools.computer import open_application, APPLICATIONS
+from tools.web_search import web_search
+from tools.reminders import (
+    add_reminder,
+    list_reminders,
+    delete_reminder,
+    start_reminder_checker,
+)
+from tools.file_search import file_search
 
 load_dotenv()
 
@@ -15,18 +23,21 @@ if not api_key:
         "GEMINI_API_KEY not found. Make sure it's set in your .env file."
     )
 
-client = genai.Client(api_key="Your API key here")  # Replace with your actual API key
+client = genai.Client(api_key=api_key)
 
 MODEL_NAME = "gemini-3.6-flash"
 
 SYSTEM_INSTRUCTION = (
     "You are JARVIS, a helpful personal AI assistant. "
     "You are concise, a little witty, and speak like a capable assistant, "
-    "not a search engine. When the user asks you to open an application, "
-    "use the open_application tool rather than just describing what you'd do."
+    "not a search engine. Use the tools available to you rather than just "
+    "describing what you'd do. For reminders, always convert relative times "
+    "like 'in 10 minutes' or 'tomorrow morning' into HH:MM or "
+    "YYYY-MM-DD HH:MM before calling add_reminder."
 )
 
-# --- Tool declaration: tells Gemini this function exists and how to call it ---
+# --- Tool declarations ---
+
 open_application_declaration = types.FunctionDeclaration(
     name="open_application",
     description=(
@@ -45,17 +56,102 @@ open_application_declaration = types.FunctionDeclaration(
     },
 )
 
-jarvis_tool = types.Tool(function_declarations=[open_application_declaration])
+web_search_declaration = types.FunctionDeclaration(
+    name="web_search",
+    description="Searches the web and returns a summary of top results. Use this for anything requiring current or factual information you're not certain about.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query.",
+            }
+        },
+        "required": ["query"],
+    },
+)
 
-# Maps tool names Gemini can call -> actual Python functions that execute them
+add_reminder_declaration = types.FunctionDeclaration(
+    name="add_reminder",
+    description="Adds a reminder that will be spoken aloud when it comes due.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "What to remind the user about.",
+            },
+            "time_str": {
+                "type": "string",
+                "description": "When to remind, formatted as HH:MM (today) or YYYY-MM-DD HH:MM.",
+            },
+        },
+        "required": ["text", "time_str"],
+    },
+)
+
+list_reminders_declaration = types.FunctionDeclaration(
+    name="list_reminders",
+    description="Lists all upcoming reminders that haven't triggered yet.",
+    parameters={"type": "object", "properties": {}},
+)
+
+delete_reminder_declaration = types.FunctionDeclaration(
+    name="delete_reminder",
+    description="Deletes a reminder by its id (shown by list_reminders).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "reminder_id": {
+                "type": "string",
+                "description": "The short id of the reminder to delete.",
+            }
+        },
+        "required": ["reminder_id"],
+    },
+)
+
+file_search_declaration = types.FunctionDeclaration(
+    name="file_search",
+    description="Searches for files by name within the user's home folder (Desktop, Documents, Downloads, Pictures, etc).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "filename": {
+                "type": "string",
+                "description": "Full or partial filename to search for.",
+            }
+        },
+        "required": ["filename"],
+    },
+)
+
+jarvis_tool = types.Tool(
+    function_declarations=[
+        open_application_declaration,
+        web_search_declaration,
+        add_reminder_declaration,
+        list_reminders_declaration,
+        delete_reminder_declaration,
+        file_search_declaration,
+    ]
+)
+
 AVAILABLE_FUNCTIONS = {
     "open_application": open_application,
+    "web_search": web_search,
+    "add_reminder": add_reminder,
+    "list_reminders": list_reminders,
+    "delete_reminder": delete_reminder,
+    "file_search": file_search,
 }
+
+# Start the background thread that watches for due reminders and speaks them
+start_reminder_checker()
 
 
 class JarvisBrain:
     def __init__(self):
-        # Keeps conversation history so JARVIS has memory within a session
         self.history = []
 
     def ask(self, user_input: str) -> str:
@@ -91,7 +187,6 @@ class JarvisBrain:
         return None
 
     def _handle_function_call(self, candidate, function_call) -> str:
-        # Record the model's function-call turn in history
         self.history.append(candidate.content)
 
         name = function_call.name
@@ -107,7 +202,6 @@ class JarvisBrain:
             except Exception as error:
                 result_text = f"Error running {name}: {error}"
 
-        # Send the tool's result back to Gemini so it can phrase a natural reply
         function_response_part = types.Part.from_function_response(
             name=name,
             response={"result": result_text},
